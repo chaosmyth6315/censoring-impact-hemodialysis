@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this code or these results, please cite the paper."
+title: "Censoring impact in time-updated mortality prediction for hemodialysis: code and aggregate results"
+version: 0.1.0
+date-released: 2026-09-30
+license: MIT
+authors:
+  - family-names: Fang
+    given-names: Yu-Wei
+  - family-names: Huang
+    given-names: Yen-Chun
+  - family-names: Wang
+    given-names: Jing Tong
+  - family-names: Tsai
+    given-names: Ming-Hsien
+preferred-citation:
+  type: article
+  title: "How much is the non-informative censoring assumption worth? A fixed-model sensitivity analysis of time-updated mortality prediction in hemodialysis"
+  authors:
+    - family-names: Fang
+      given-names: Yu-Wei
+    - family-names: Huang
+      given-names: Yen-Chun
+    - family-names: Wang
+      given-names: Jing Tong
+    - family-names: Tsai
+      given-names: Ming-Hsien

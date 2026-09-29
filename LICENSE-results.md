@@ -1,0 +1,1 @@
+The aggregate result tables in `results/` are licensed under the Creative Commons Attribution 4.0 International License (CC BY 4.0): https://creativecommons.org/licenses/by/4.0/. Please cite the paper when using them.

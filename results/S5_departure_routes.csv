@@ -1,0 +1,9 @@
+route,n_cohort,pct_cohort,n_test_patients,recorded_deaths,assumption
+Transfer to another dialysis unit,465,83.63309352517986,65,0,stayer rate
+Absent from the final annual report,23,4.136690647482014,1,2,stayer rate
+Kidney transplantation,22,3.9568345323741005,1,0,alive
+Change to peritoneal dialysis,18,3.237410071942446,2,0,stayer rate
+Status code 4 (not in the data dictionary),11,1.9784172661870503,1,0,stayer rate
+Recovery of kidney function,8,1.4388489208633093,1,0,alive
+Withdrawal from dialysis,6,1.079136690647482,0,0,dead
+"Exit, reason not stated",3,0.539568345323741,1,0,stayer rate
