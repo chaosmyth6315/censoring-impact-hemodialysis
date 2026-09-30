@@ -76,6 +76,8 @@ for k in ('c', 'G', 'km'):
 
 print('\n=== 2. whole analysis on the synthetic example ===')
 csv = HERE/'examples'/'example_evaluation.csv'
+if not csv.exists():                                     # a fresh download ships only the generator
+    subprocess.run([sys.executable, str(HERE/'examples'/'make_example_data.py')], check=True, cwd=HERE)
 d = pd.read_csv(csv)
 arm = Arm(pid=d.patient_id.values, time=d.time.values, event=d.event.values, departed=d.departed.values,
           route=d.route.fillna('').values)
