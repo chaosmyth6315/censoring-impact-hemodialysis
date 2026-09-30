@@ -46,12 +46,37 @@ def _bool(s: pd.Series, name: str) -> np.ndarray:
     return v.to_numpy(dtype=bool)
 
 
+def _read(path: str, a) -> pd.DataFrame:
+    """Read a CSV, keeping the identifier (and route) exactly as written: '001' and '1' stay different patients."""
+    text_cols = [c for c in (a.id, a.route) if c]
+    df = pd.read_csv(path, dtype={c: str for c in text_cols}, keep_default_na=False, na_values={})
+    for c in df.columns:
+        if c not in text_cols:
+            df[c] = df[c].replace('', np.nan) if df[c].dtype == object else df[c]
+    return df
+
+
+def _num(df: pd.DataFrame, c: str, where: str) -> np.ndarray:
+    v = pd.to_numeric(df[c], errors='coerce')
+    bad = v.isna() & df[c].notna() | df[c].isna()
+    if bad.any():
+        raise SystemExit(f'{where}: column {c!r} must be numeric on every row; '
+                         f'problem at data row(s) {list(np.flatnonzero(bad.to_numpy())[:5] + 2)}')
+    return v.to_numpy(dtype=float)
+
+
+def _risk_h(df: pd.DataFrame, c: str, elig: np.ndarray) -> np.ndarray:
+    """Predicted risk by the horizon: must be numeric on calibration-eligible rows; other rows are not used."""
+    _num(df[elig], c, '--data (calibration-eligible rows)')
+    return pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=float)
+
+
 def _arm(df: pd.DataFrame, a, label: str) -> Arm:
     need = [a.id, a.time, a.event, a.departed] + ([a.route] if a.route else [])
     miss = [c for c in need if c not in df.columns]
     if miss:
         raise SystemExit(f'{label}: missing columns {miss}')
-    return Arm(pid=df[a.id], time=df[a.time], event=_bool(df[a.event], a.event),
+    return Arm(pid=df[a.id], time=_num(df, a.time, label), event=_bool(df[a.event], a.event),
                departed=_bool(df[a.departed], a.departed), route=df[a.route] if a.route else None)
 
 
@@ -79,20 +104,25 @@ def main(argv=None):
     p.add_argument('--out', required=True, help='output folder')
     a = p.parse_args(argv)
 
-    df = pd.read_csv(a.data)
+    df = _read(a.data, a)
     ev = _arm(df, a, '--data')
     models = _pairs(a.model, '--model')
     rh = _pairs(a.risk_at_horizon, '--risk-at-horizon') or None
     for c in list(models.values()) + list((rh or {}).values()):
         if c not in df.columns:
             raise SystemExit(f'--data: missing column {c!r}')
-    weights = _arm(pd.read_csv(a.weights_data), a, '--weights-data') if a.weights_data else None
-    cfg = Config(risk={k: df[c].to_numpy(dtype=float) for k, c in models.items()}, reference=a.reference,
-                 risk_h={k: df[c].to_numpy(dtype=float) for k, c in rh.items()} if rh else None, horizon=a.horizon,
-                 calibration_eligible=_bool(df[a.calibration_eligible], a.calibration_eligible) if a.calibration_eligible else None,
+    weights = _arm(_read(a.weights_data, a), a, '--weights-data') if a.weights_data else None
+    elig = _bool(df[a.calibration_eligible], a.calibration_eligible) if a.calibration_eligible else np.ones(len(df), bool)
+    cfg = Config(risk={k: _num(df, c, '--data') for k, c in models.items()}, reference=a.reference,
+                 risk_h={k: _risk_h(df, c, elig) for k, c in rh.items()} if rh else None,
+                 horizon=a.horizon,
+                 calibration_eligible=elig if a.calibration_eligible else None,
                  fractions=tuple(float(x) for x in a.fractions.split(',')), n_draws=a.draws, n_boot=a.boot,
                  seed=a.seed, between_patient=a.between_patient)
-    res = run(ev, cfg, weights)
+    try:
+        res = run(ev, cfg, weights)
+    except ValueError as e:
+        raise SystemExit(f'error: {e}')
     record = dict(tool='censoring_impact', version=__version__, python=platform.python_version(),
                   arguments=vars(a), command=' '.join(sys.argv))
     files = write(res, cfg, Path(a.out), record)

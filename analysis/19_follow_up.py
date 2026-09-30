@@ -18,7 +18,7 @@ YR = 365.25
 rows = []
 for arm, tm, ev, pid in (('development', S.dev_tm, S.dev_ev0, S.dev_pid), ('test', S.tm, S.ev0, S.pid)):
     q25, q50, q75 = np.percentile(tm / YR, [25, 50, 75])
-    t, s = kaplan_meier_estimator(~ev, tm)                      # 反向 KM:設限為「事件」
+    t, s = kaplan_meier_estimator(ev, tm, reverse=True)         # 反向 KM(sksurv 規則:同一天的死亡先移出風險集)
     rkm = float(t[np.argmax(s <= 0.5)] / YR) if (s <= 0.5).any() else float('nan')
     rows.append(dict(arm=arm, landmarks=len(tm), patients=len(np.unique(pid)), deaths=int(ev.sum()),
                      median_years=q50, q25_years=q25, q75_years=q75, reverse_km_median_years=rkm))

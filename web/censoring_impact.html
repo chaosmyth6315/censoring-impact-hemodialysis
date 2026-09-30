@@ -130,7 +130,8 @@ nothing is uploaded or sent anywhere. The page works offline.</div>
   route-informed scenario and the extreme.</li>
   <li>Harrell's C and the Kaplan–Meier and censoring estimators follow scikit-survival. In the scenarios without random
   assignment, C and O:E match the Python tool exactly; the calibration slope is solved to full convergence and can differ
-  from the Python tool's in the fourth decimal place. Random scenarios use a different random-number generator from the
+  from the Python tool's in the fourth decimal place, and is shown as unavailable (—) when the fit does not converge.
+  Numbers of patients assigned death are rounded as in the Python tool (halves to the even number). Random scenarios use a different random-number generator from the
   Python tool, so they differ slightly from it (Monte Carlo variation), as do bootstrap intervals.</li>
   <li>The scenarios are alternative outcome definitions, not a formal bound on true performance.</li>
 </ul>
@@ -146,24 +147,46 @@ const TIE_TOL = 1e-8;
 
 function parseCSV(text) {
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-  const rows = []; let row = [], field = '', q = false;
+  const rows = []; let row = [], field = '', q = false, quoted = false;
+  const end = () => { row.push(field); field = ''; quoted = false; };
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (q) {
       if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; }
       else field += c;
-    } else if (c === '"') q = true;
-    else if (c === ',') { row.push(field); field = ''; }
+    } else if (c === '"' && field === '' && !quoted) { q = true; quoted = true; }
+    else if (c === ',') end();
     else if (c === '\n' || c === '\r') {
       if (c === '\r' && text[i + 1] === '\n') i++;
-      row.push(field); field = '';
+      end();
       if (row.length > 1 || row[0] !== '') rows.push(row);
       row = [];
     } else field += c;
   }
-  if (field !== '' || row.length) { row.push(field); if (row.length > 1 || row[0] !== '') rows.push(row); }
+  if (q) throw new Error('the file ends inside a quoted field (a " is not closed)');
+  if (field !== '' || row.length) { end(); if (row.length > 1 || row[0] !== '') rows.push(row); }
+  if (!rows.length) throw new Error('the file is empty');
   const header = rows.shift().map(h => h.trim());
+  if (header.some(h => h === '')) throw new Error('every column needs a name in the first row');
+  const dup = header.filter((h, i) => header.indexOf(h) !== i);
+  if (dup.length) throw new Error(`column names must be unique; repeated: ${[...new Set(dup)].join(', ')}`);
+  const bad = rows.findIndex(r => r.length !== header.length);
+  if (bad >= 0) throw new Error(`row ${bad + 2} has ${rows[bad].length} fields but the header has ${header.length}`);
   return { header, rows };
+}
+
+// Python's round(): halves go to the even neighbour (2.5 -> 2, 3.5 -> 4), so counts match the Python tool
+function roundHalfEven(x) { return Math.abs(x - Math.trunc(x)) === 0.5 ? 2 * Math.round(x / 2) : Math.round(x); }
+
+// scenario identifier for an assumed share, as in the Python tool: two to four decimals, never shared by two shares
+function fractionName(f) { const s = f.toFixed(4).replace(/0+$/, ''); return 'fraction_' + (s.split('.')[1].length >= 2 ? s : f.toFixed(2)); }
+function checkFractions(fr) {
+  for (const f of fr) {
+    if (!(f > 0 && f < 1)) throw new Error(`assumed shares must be between 0 and 1, got ${f}`);
+    if (Math.abs(f * 1e4 - Math.round(f * 1e4)) > 1e-6) throw new Error(`assumed shares take at most four decimal places, got ${f}`);
+  }
+  if (new Set(fr.map(fractionName)).size !== fr.length) throw new Error('assumed shares must be distinct');
+  return fr;
 }
 
 function makeRng(seed) {                       // mulberry32
@@ -262,57 +285,77 @@ function censoringEstimator(time, event) {
   if (!anyCens) return { times, probs: probs.map(() => 1), allEvents: true };
   return { times, probs, allEvents: false };
 }
-function predictG(est, t) {
+function predictG(est, t) {                     // sksurv CensoringDistributionEstimator.predict_proba
   const T = est.times, P = est.probs;
   if (t > T[T.length - 1]) { if (P[P.length - 1] > 0) throw new Error('the calibration horizon is later than the last follow-up time in the data'); return 0; }
-  let lo = 0, hi = T.length - 1, idx = -1;
-  while (lo <= hi) { const m = (lo + hi) >> 1; if (T[m] <= t) { idx = m; lo = m + 1; } else hi = m - 1; }
-  return idx < 0 ? 1 : P[idx];
+  let lo = 0, hi = T.length;                     // first index with T[i] >= t (numpy searchsorted, left)
+  while (lo < hi) { const m = (lo + hi) >> 1; if (T[m] < t) lo = m + 1; else hi = m; }
+  const i = Math.abs(T[lo] - t) < Number.EPSILON ? lo : lo - 1;
+  return i < 0 ? 1 : P[i];
 }
 
-// unpenalized weighted logistic regression, Newton-Raphson
+// unpenalized weighted logistic regression: Newton-Raphson with step halving; NaN when the fit does not converge
+// (separation, or no spread in the predictor), rather than returning an unconverged value
 function logisticFit(x, y, w) {
-  let a = 0, b = 0;
-  for (let it = 0; it < 100; it++) {
+  const nan = { intercept: NaN, slope: NaN };
+  const ll = (a, b) => { let s = 0; for (let i = 0; i < x.length; i++) { const e = a + b * x[i];
+    s += w[i] * (y[i] * e - (e > 0 ? e + Math.log1p(Math.exp(-e)) : Math.log1p(Math.exp(e)))); } return s; };
+  let a = 0, b = 0, cur = ll(0, 0);
+  for (let it = 0; it < 200; it++) {
     let ga = 0, gb = 0, haa = 0, hab = 0, hbb = 0;
     for (let i = 0; i < x.length; i++) {
       const p = 1 / (1 + Math.exp(-(a + b * x[i]))), q = w[i] * p * (1 - p), r = w[i] * (y[i] - p);
       ga += r; gb += r * x[i]; haa += q; hab += q * x[i]; hbb += q * x[i] * x[i];
     }
-    const det = haa * hbb - hab * hab; if (!(det > 0)) break;
+    const det = haa * hbb - hab * hab;
+    if (!(det > 1e-12 * Math.max(1, haa * hbb)) || !Number.isFinite(det)) return nan;
     const da = (hbb * ga - hab * gb) / det, db = (haa * gb - hab * ga) / det;
-    a += da; b += db; if (Math.abs(da) < 1e-12 && Math.abs(db) < 1e-12) break;
+    if (Math.abs(da) < 1e-10 && Math.abs(db) < 1e-10) return Number.isFinite(b) ? { intercept: a, slope: b } : nan;
+    let step = 1, next;
+    while (step > 1e-10) { next = ll(a + step * da, b + step * db); if (next >= cur - 1e-12 * Math.abs(cur)) break; step /= 2; }
+    if (step <= 1e-10) return nan;
+    a += step * da; b += step * db; cur = next;
+    if (Math.abs(b) > 1e6) return nan;
   }
-  return { intercept: a, slope: b };
+  return nan;
 }
 
 function calibration(event, time, idx, riskH, H, G) {
-  const n = idx.length, bb = new Int8Array(n), w = new Float64Array(n); let has0 = false, has1 = false;
+  const n = idx.length; if (!n) return null;
+  const bb = new Int8Array(n), w = new Float64Array(n); let has0 = false, has1 = false;
   for (let k = 0; k < n; k++) {
     const i = idx[k], t = time[i];
-    if (event[i] && t <= H) { bb[k] = 1; w[k] = 1 / predictG(G, t); has1 = true; }
-    else if (t > H) { bb[k] = 0; w[k] = 1 / predictG(G, H); has0 = true; }
-    else bb[k] = -1;
+    if (event[i] && t <= H) { bb[k] = 1; has1 = true; } else if (t > H) { bb[k] = 0; has0 = true; } else bb[k] = -1;
   }
-  const ok = []; for (let k = 0; k < n; k++) if (bb[k] >= 0) { if (!Number.isFinite(w[k]) || w[k] <= 0) return null; ok.push(k); }
-  if (!has0 || !has1) return null;
+  const ok = []; for (let k = 0; k < n; k++) if (bb[k] >= 0) ok.push(k);
+  let fitOk = has0 && has1;
+  if (fitOk) {
+    for (const k of ok) { const t = time[idx[k]]; w[k] = 1 / predictG(G, bb[k] === 1 ? t : H); }
+    fitOk = ok.every(k => Number.isFinite(w[k]) && w[k] > 0);
+  }
   const observed = 1 - kmAt(time, event, idx, H), out = {};
   for (const [m, r] of Object.entries(riskH)) {
-    const x = ok.map(k => { const v = r[idx[k]]; return Math.log(Math.min(Math.max(v, 1e-6), 1 - 1e-6) / Math.min(Math.max(1 - v, 1e-6), 1)); });
-    const f = logisticFit(x, ok.map(k => bb[k]), ok.map(k => w[k]));
     let s = 0; for (const i of idx) s += r[i];
     const expected = s / n;
-    out[m] = { slope: f.slope, intercept: f.intercept, observed, expected, oe: observed / expected, n_km: n, n_slope: ok.length };
+    let f = { slope: NaN, intercept: NaN };
+    if (fitOk) {
+      const x = ok.map(k => { const v = r[idx[k]]; return Math.log(Math.min(Math.max(v, 1e-6), 1 - 1e-6) / Math.min(Math.max(1 - v, 1e-6), 1)); });
+      if (Math.max(...x) > Math.min(...x)) f = logisticFit(x, ok.map(k => bb[k]), ok.map(k => w[k]));
+    }
+    out[m] = { slope: f.slope, intercept: f.intercept, observed, expected, oe: expected > 0 ? observed / expected : NaN,
+      n_km: n, n_slope: Number.isFinite(f.slope) ? ok.length : 0 };
   }
   return out;
 }
 
 function oeCrossing(points) {
   const pts = points.slice().sort((a, b) => a[0] - b[0]);
-  const below = pts.filter(p => p[1] < 1), above = pts.filter(p => p[1] > 1);
-  if (!below.length || !above.length) return null;
-  const lo = below[below.length - 1], hi = above[0]; if (hi[0] <= lo[0]) return null;
-  return lo[0] + (1 - lo[1]) * (hi[0] - lo[0]) / (hi[1] - lo[1]);
+  const hit = pts.find(p => p[1] === 1); if (hit) return hit[0];
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [f0, o0] = pts[i], [f1, o1] = pts[i + 1];
+    if ((o0 - 1) * (o1 - 1) < 0 && f1 > f0) return f0 + (1 - o0) * (f1 - f0) / (o1 - o0);
+  }
+  return null;
 }
 
 // ---------------- analysis ----------------
@@ -330,11 +373,14 @@ function prepare(d) {
     if (!['censored', 'dead', 'random'].includes(c)) throw new Error(`route for departed patient ${p} must be censored, dead or random (found "${c}")`); }
   let st = 0, sn = 0;
   for (const [p, rows] of groups) if (!d.departed[rows[0]]) { sn++; if (rows.some(i => d.event[i])) st++; }
-  return { ...d, n, groups, depIds, stayerRate: sn ? st / sn : NaN };
+  if (!sn) throw new Error('every patient left follow-up, so the stayer rate is undefined');
+  if (!d.event.some(v => v)) throw new Error('no deaths are recorded, so the concordance index is undefined');
+  for (const [m, v] of Object.entries(d.risk)) if (v.length !== n || !v.every(Number.isFinite)) throw new Error(`risk scores for ${m} must be complete numbers`);
+  return { ...d, n, groups, depIds, stayerRate: st / sn };
 }
 
 function scenarios(fractions, rate, withRoute) {
-  const fr = fractions.map(f => ({ name: 'fraction_' + f.toFixed(2), kind: 'fraction', fraction: f }));
+  const fr = checkFractions(fractions).map(f => ({ name: fractionName(f), kind: 'fraction', fraction: f }));
   fr.push({ name: 'stayer_rate', kind: 'stayer', fraction: rate }); fr.sort((a, b) => a.fraction - b.fraction);
   const out = [{ name: 'as_analyzed', kind: 'none', fraction: 0 }, ...fr];
   if (withRoute) out.push({ name: 'route_informed', kind: 'route', fraction: null });
@@ -344,6 +390,7 @@ function scenarios(fractions, rate, withRoute) {
 
 async function runAnalysis(D, cfg, progress = () => {}) {
   const X = prepare(D), models = Object.keys(X.risk), rng = makeRng(cfg.seed);
+  if (!models.includes(cfg.reference)) throw new Error(`the reference model ${cfg.reference} is not among the models`);
   const SC = scenarios(cfg.fractions, X.stayerRate, !!X.route);
   const det = s => s.kind === 'none' || s.kind === 'all';
   const nd = s => det(s) ? 1 : cfg.draws;
@@ -355,17 +402,19 @@ async function runAnalysis(D, cfg, progress = () => {}) {
     for (let d = 0; d < cfg.draws; d++) {
       if (s.kind === 'route') {
         const stoch = X.depIds.filter(p => route[p] === 'random'), forced = X.depIds.filter(p => route[p] === 'dead');
-        pool[s.name].push(new Set([...sampleWithout(rng, stoch, Math.round(X.stayerRate * stoch.length)), ...forced]));
-      } else pool[s.name].push(new Set(sampleWithout(rng, X.depIds, Math.round(s.fraction * X.depIds.length))));
+        pool[s.name].push(new Set([...sampleWithout(rng, stoch, roundHalfEven(X.stayerRate * stoch.length)), ...forced]));
+      } else pool[s.name].push(new Set(sampleWithout(rng, X.depIds, roundHalfEven(s.fraction * X.depIds.length))));
     }
   }
+  const KEY = new Set(['as_analyzed', 'stayer_rate', 'route_informed', 'all_departed_died']);   // bootstrapped scenarios
   const eventsCache = new Map();
   function events(s, d) {
     const key = s.name + ':' + d; if (eventsCache.has(key)) return eventsCache.get(key);
     const dead = s.kind === 'none' ? new Set() : s.kind === 'all' ? new Set(X.depIds) : pool[s.name][d];
     const ev = new Uint8Array(X.n);
     for (let i = 0; i < X.n; i++) ev[i] = X.event[i] || (X.departed[i] && dead.has(X.pid[i])) ? 1 : 0;
-    eventsCache.set(key, ev); return ev;
+    if (KEY.has(s.name)) eventsCache.set(key, ev);
+    return ev;
   }
   const R = Object.fromEntries(models.map(m => [m, riskRanks(X.risk[m])]));
   const ALL = Int32Array.from({ length: X.n }, (_, i) => i);
@@ -396,7 +445,8 @@ async function runAnalysis(D, cfg, progress = () => {}) {
     for (const s of key) {
       const ev = events(s, det(s) ? 0 : Math.floor(drng() * cfg.draws));
       let ne = 0; for (const i of idx) ne += ev[i]; if (ne < 20) continue;
-      boot[s.name].push(Object.fromEntries(models.map(m => [m, harrellC(X.time, ev, R[m], idx)])));
+      const c = Object.fromEntries(models.map(m => [m, harrellC(X.time, ev, R[m], idx)]));
+      if (Object.values(c).every(Number.isFinite)) boot[s.name].push(c);
     }
     if (b % 20 === 19) { progress(0.05 + 0.45 * (b + 1) / cfg.boot, `Bootstrap for C (${b + 1}/${cfg.boot})`); await tick(); }
   }
@@ -413,9 +463,14 @@ async function runAnalysis(D, cfg, progress = () => {}) {
   }
   const res = { exposure: exposure(X), scenarios: SC, discrimination: disc, paired, calibration: null, crossing: null, models };
   // ---- calibration
-  if (!X.riskH || !Object.keys(X.riskH).length || !(cfg.horizon > 0)) { progress(1, 'Done'); return res; }
+  if (!X.riskH || !Object.keys(X.riskH).length) { progress(1, 'Done'); return res; }
+  if (!(cfg.horizon > 0) || !Number.isFinite(cfg.horizon)) throw new Error('a positive horizon is needed for calibration');
   const H = cfg.horizon, sub = []; for (let i = 0; i < X.n; i++) if (!X.elig || X.elig[i]) sub.push(i);
-  const G = new Map(), Gfor = (s, d) => { const k = s.name + ':' + d; if (!G.has(k)) G.set(k, censoringEstimator(X.time, events(s, d))); return G.get(k); };
+  for (const [m, v] of Object.entries(X.riskH))
+    if (v.length !== X.n || !sub.every(i => Number.isFinite(v[i]) && v[i] >= 0 && v[i] <= 1))
+      throw new Error(`predicted risks for ${m} must be probabilities between 0 and 1 on every row used for calibration`);
+  const G = new Map(), Gfor = (s, d) => { const k = s.name + ':' + d; if (G.has(k)) return G.get(k);
+    const g = censoringEstimator(X.time, events(s, d)); if (KEY.has(s.name)) G.set(k, g); return g; };
   const hm = Object.keys(X.riskH), cal = [];
   for (const s of SC) {
     const acc = Object.fromEntries(hm.map(m => [m, []]));
@@ -424,9 +479,10 @@ async function runAnalysis(D, cfg, progress = () => {}) {
       for (const m of hm) acc[m].push(r[m]);
     }
     for (const m of hm) {
-      const v = acc[m], f = k => v.length ? mean(v.map(x => x[k])) : NaN;
+      const v = acc[m], f = k => { const u = v.map(x => x[k]).filter(Number.isFinite); return u.length ? mean(u) : NaN; };
+      const fitted = v.filter(x => Number.isFinite(x.slope)).map(x => x.n_slope);
       cal.push({ scenario: s.name, fraction: s.fraction, model: m, slope: f('slope'), intercept: f('intercept'), observed: f('observed'),
-        expected: f('expected'), oe: f('oe'), n_km: Math.round(f('n_km')), n_slope: Math.round(f('n_slope')) });
+        expected: f('expected'), oe: f('oe'), n_km: v.length ? roundHalfEven(f('n_km')) : 0, n_slope: fitted.length ? roundHalfEven(mean(fitted)) : 0 });
     }
     progress(0.5 + 0.1 * (SC.indexOf(s) + 1) / SC.length, 'Calibration'); await tick();
   }
@@ -438,12 +494,13 @@ async function runAnalysis(D, cfg, progress = () => {}) {
     if (idx.length >= 200) for (const s of key) {
       const d = det(s) ? 0 : Math.floor(cdr() * cfg.draws);
       const r = calibration(events(s, d), X.time, idx, X.riskH, H, Gfor(s, d)); if (!r) continue;
-      for (const m of hm) { bacc[s.name + '|' + m].slope.push(r[m].slope); bacc[s.name + '|' + m].oe.push(r[m].oe); }
+      for (const m of hm) for (const q of ['slope', 'oe']) if (Number.isFinite(r[m][q])) bacc[s.name + '|' + m][q].push(r[m][q]);
     }
     if (b % 20 === 19) { progress(0.6 + 0.4 * (b + 1) / cfg.boot, `Bootstrap for calibration (${b + 1}/${cfg.boot})`); await tick(); }
   }
   for (const r of cal) { const a = bacc[r.scenario + '|' + r.model]; if (!a) continue;
-    for (const q of ['slope', 'oe']) if (a[q].length) { r[q + '_ci_low'] = percentile(a[q], 2.5); r[q + '_ci_high'] = percentile(a[q], 97.5); } }
+    for (const q of ['slope', 'oe']) { if (a[q].length) { r[q + '_ci_low'] = percentile(a[q], 2.5); r[q + '_ci_high'] = percentile(a[q], 97.5); }
+      r[q + '_n_boot'] = a[q].length; } }
   res.calibration = cal;
   const ref = hm.includes(cfg.reference) ? cfg.reference : hm[0];
   res.calRef = ref;
@@ -457,11 +514,12 @@ function exposure(X) {
   let died = 0; for (const rows of X.groups.values()) if (rows.some(i => X.event[i])) died++;
   return { rows: X.n, patients: X.groups.size, rows_departed: rowsDep, share_rows_departed: rowsDep / X.n,
     departed_patients: X.depIds.length, events_in_departed_rows: evDep, events: ev, patients_died: died,
-    stayer_rate: X.stayerRate, assigned_at_stayer_rate: Math.round(X.stayerRate * X.depIds.length), route: !!X.route };
+    stayer_rate: X.stayerRate, assigned_at_stayer_rate: roundHalfEven(X.stayerRate * X.depIds.length), route: !!X.route };
 }
 
 if (typeof module !== 'undefined') module.exports = { parseCSV, harrellC, harrellCounts, betweenPatientC, riskRanks, kmAt,
-  censoringEstimator, predictG, logisticFit, calibration, oeCrossing, runAnalysis, prepare, scenarios };
+  censoringEstimator, predictG, logisticFit, calibration, oeCrossing, runAnalysis, prepare, scenarios, roundHalfEven,
+  fractionName, checkFractions };
 </script>
 
 <script>
@@ -518,6 +576,7 @@ function column(name, kind) {
 }
 $('run').onclick = async () => {
   $('error').textContent = ''; $('run').disabled = true; $('bar').style.width = '0';
+  last = null; $('out').innerHTML = ''; $('results').classList.add('hidden');     // never leave an earlier run on screen
   try {
     const risk = {}, riskH = {}; let reference = null;
     for (const tr of $('models').children) {
@@ -616,8 +675,10 @@ function chartOE(r, g) {
   return `<svg viewBox="0 0 640 300" width="100%" role="img" aria-label="Observed to expected ratio by assumed share of departed patients who died">${s}<text transform="rotate(-90)" x="-139" y="14" text-anchor="middle">Observed : expected</text></svg>`;
 }
 
+function csvField(v) { const s = v === undefined || v === null || (typeof v === 'number' && !Number.isFinite(v)) ? '' : String(v);
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
 function toCSV(rows) { if (!rows || !rows.length) return ''; const k = Object.keys(rows.reduce((a, r) => Object.assign(a, r), {}));
-  return [k.join(','), ...rows.map(r => k.map(c => r[c] === undefined || r[c] === null ? '' : String(r[c])).join(','))].join('\n'); }
+  return [k.map(csvField).join(','), ...rows.map(r => k.map(c => csvField(r[c])).join(','))].join('\n'); }
 function download(name, text) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); }
 $('dl-disc').onclick = () => last && download('discrimination_by_scenario.csv', toCSV(last.discrimination));
 $('dl-paired').onclick = () => last && download('paired_differences.csv', toCSV(last.paired));

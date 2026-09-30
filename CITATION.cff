@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this code or these results, please cite the paper."
 title: "Censoring impact in time-updated mortality prediction for hemodialysis: code and aggregate results"
-version: 0.2.1
+version: 0.3.0
 date-released: 2026-09-30
 license: MIT
 doi: 10.5281/zenodo.23055754

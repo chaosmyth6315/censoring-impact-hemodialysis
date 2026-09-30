@@ -27,6 +27,44 @@ _SK = tuple(int(x) for x in sklearn.__version__.split('.')[:2])
 _UNPENALIZED = dict(C=np.inf) if _SK >= (1, 8) else dict(penalty=None)
 
 
+_TRUE, _FALSE = {'1', 'true', 'yes'}, {'0', 'false', 'no'}
+
+
+def binary(values, name: str) -> np.ndarray:
+    """0/1 flags as booleans; anything else (strings like 'maybe', missing values, 2) is an error."""
+    v = np.asarray(values)
+    if v.dtype == bool:
+        return v
+    if v.dtype.kind in 'iuf':
+        if not np.isin(v, (0, 1)).all():
+            raise ValueError(f'{name} must be 0/1; found {sorted(set(v[~np.isin(v, (0, 1))].tolist()))[:5]}')
+        return v.astype(bool)
+    s = pd.Series(v).astype(str).str.strip().str.lower()
+    bad = ~s.isin(_TRUE | _FALSE) | pd.isna(pd.Series(v))
+    if bad.any():
+        raise ValueError(f'{name} must be 0/1 or true/false; found {sorted(pd.Series(v)[bad].astype(str).unique())[:5]}')
+    return s.isin(_TRUE).to_numpy()
+
+
+def fraction_name(f: float) -> str:
+    """Scenario identifier for an assumed share: two to four decimals, so distinct shares never share a name."""
+    s = f'{f:.4f}'.rstrip('0')
+    return 'fraction_' + (s if len(s.split('.')[1]) >= 2 else f'{f:.2f}')
+
+
+def check_fractions(fractions) -> tuple:
+    fr = tuple(float(f) for f in fractions)
+    for f in fr:
+        if not 0 < f < 1:
+            raise ValueError(f'assumed shares must be between 0 and 1, got {f}')
+        if abs(f * 1e4 - round(f * 1e4)) > 1e-6:
+            raise ValueError(f'assumed shares take at most four decimal places, got {f}')
+    names = [fraction_name(f) for f in fr]
+    if len(set(names)) != len(names):
+        raise ValueError(f'assumed shares must be distinct, got {fr}')
+    return fr
+
+
 @dataclass
 class Arm:
     """Rows of one data set (the evaluation set, or the set used to estimate censoring weights)."""
@@ -37,14 +75,17 @@ class Arm:
     route: np.ndarray | None = None   # route code per row (constant within patient), or None
 
     def __post_init__(self):
-        self.pid = np.asarray(self.pid).astype(str)
+        raw = pd.Series(np.asarray(self.pid, dtype=object))
+        if raw.isna().any() or (raw.astype(str).str.strip() == '').any():
+            raise ValueError('every row needs a patient identifier')
+        self.pid = raw.astype(str).to_numpy()
         self.time = np.asarray(self.time, dtype=float)
-        self.event = np.asarray(self.event).astype(bool)
-        self.departed = np.asarray(self.departed).astype(bool)
+        self.event = binary(self.event, 'event')
+        self.departed = binary(self.departed, 'departed')
         n = len(self.pid)
         if not (len(self.time) == len(self.event) == len(self.departed) == n):
             raise ValueError('id, time, event and departed must have the same length')
-        if np.isnan(self.time).any() or (self.time < 0).any():
+        if not np.isfinite(self.time).all() or (self.time < 0).any():
             raise ValueError('follow-up times must be non-negative numbers')
         per_pt = pd.Series(self.departed).groupby(self.pid).nunique()
         if (per_pt > 1).any():
@@ -68,6 +109,8 @@ class Arm:
 def stayer_rate(arm: Arm) -> float:
     """Share of never-departed patients with a recorded death (patient level)."""
     stay = pd.Series(arm.event[~arm.departed]).groupby(arm.pid[~arm.departed]).max()
+    if stay.empty:
+        raise ValueError('every patient left follow-up, so the stayer rate is undefined')
     return float(stay.mean())
 
 
@@ -84,7 +127,7 @@ class Scenario:
 
 def build_scenarios(fractions, rate, with_route) -> list[Scenario]:
     """Scenarios in the order reported: none, the fractions and the stayer rate by size, route-informed, all."""
-    fr = [Scenario(f'fraction_{f:.2f}', 'fraction', float(f)) for f in fractions]
+    fr = [Scenario(fraction_name(f), 'fraction', float(f)) for f in check_fractions(fractions)]
     fr.append(Scenario('stayer_rate', 'stayer', rate))
     fr.sort(key=lambda s: s.fraction)
     out = [Scenario('as_analyzed', 'none', 0.0)] + fr
@@ -108,8 +151,8 @@ def generate_draws(arms: dict[str, Arm], fractions, rate, n_draws, seed, with_ro
     for arm_name, arm in arms.items():
         ids = arm.departed_ids
         pos = {p: i for i, p in enumerate(ids)}
-        for name, frac in [(f'fraction_{f:.2f}', f) for f in fractions] + [('stayer_rate', rate)]:
-            k = int(round(frac * len(ids)))
+        for name, frac in [(fraction_name(f), f) for f in fractions] + [('stayer_rate', rate)]:
+            k = int(round(frac * len(ids)))            # halves round to even (the web version matches)
             for d in range(n_draws):
                 mask = np.zeros(len(ids), dtype=int)
                 mask[[pos[p] for p in rng.choice(ids, size=k, replace=False)]] = 1
@@ -188,42 +231,53 @@ def calibration(event, time, idx, risk_h: dict, horizon: float, cde):
 
     Observed-to-expected: Kaplan-Meier risk at the horizon over all rows idx, divided by the mean predicted risk.
     Slope: logistic regression of known horizon status (died by the horizon, or followed beyond it) on the logit
-    of predicted risk, with inverse-probability-of-censoring weights from the censoring estimator cde.
-    Returns None if the slope cannot be estimated.
+    of predicted risk, with inverse-probability-of-censoring weights from the censoring estimator cde. O:E is
+    always returned; slope and intercept are NaN when they cannot be estimated (one outcome class only, unusable
+    weights, or no spread in predicted risk).
     """
     t, e = time[idx], event[idx]
+    kt, ks = kaplan_meier_estimator(e, t)
+    observed = float(1 - (ks[kt <= horizon][-1] if np.any(kt <= horizon) else 1.0))
     b = np.full(t.size, -1, dtype=int)
     hit, free = e & (t <= horizon), t > horizon
     b[hit], b[free] = 1, 0
-    w = np.zeros(t.size)
-    if hit.any():
-        w[hit] = 1.0 / cde.predict_proba(t[hit])
-    if free.any():
-        w[free] = 1.0 / cde.predict_proba(np.full(int(free.sum()), horizon))
     ok = b >= 0
-    if np.unique(b[ok]).size < 2 or not np.isfinite(w[ok]).all() or (w[ok] <= 0).any():
-        return None
-    kt, ks = kaplan_meier_estimator(event[idx], time[idx])
-    observed = float(1 - (ks[kt <= horizon][-1] if np.any(kt <= horizon) else 1.0))
+    w = np.zeros(t.size)
+    fit_ok = np.unique(b[ok]).size == 2
+    if fit_ok:
+        if hit.any():
+            w[hit] = 1.0 / cde.predict_proba(t[hit])
+        if free.any():
+            w[free] = 1.0 / cde.predict_proba(np.full(int(free.sum()), horizon))
+        fit_ok = bool(np.isfinite(w[ok]).all() and (w[ok] > 0).all())
     out = {}
     for m, risk in risk_h.items():
         r = risk[idx]
-        x = np.log(np.clip(r[ok], 1e-6, 1 - 1e-6) / np.clip(1 - r[ok], 1e-6, 1))
-        f = LogisticRegression(solver='lbfgs', max_iter=1000, **_UNPENALIZED).fit(x[:, None], b[ok], sample_weight=w[ok])
         expected = float(r.mean())
-        out[m] = dict(slope=float(f.coef_[0, 0]), intercept=float(f.intercept_[0]), observed=observed,
-                      expected=expected, oe=observed / expected, n_km=len(idx), n_slope=int(ok.sum()))
+        slope = intercept = float('nan')
+        x = np.log(np.clip(r[ok], 1e-6, 1 - 1e-6) / np.clip(1 - r[ok], 1e-6, 1))
+        if fit_ok and np.ptp(x) > 0:
+            f = LogisticRegression(solver='lbfgs', max_iter=1000, **_UNPENALIZED).fit(x[:, None], b[ok], sample_weight=w[ok])
+            slope, intercept = float(f.coef_[0, 0]), float(f.intercept_[0])
+        out[m] = dict(slope=slope, intercept=intercept, observed=observed, expected=expected,
+                      oe=observed / expected if expected > 0 else float('nan'), n_km=len(idx),
+                      n_slope=int(ok.sum()) if np.isfinite(slope) else 0)
     return out
 
 
 def oe_crossing(points) -> dict | None:
-    """Linear interpolation of the assumed fraction at which O:E crosses 1, from (fraction, O:E) pairs."""
+    """
+    Assumed share at which O:E crosses 1, from (share, O:E) pairs in order of share: an exact 1 if one is observed,
+    otherwise linear interpolation across the first pair of neighbours on opposite sides of 1.
+    """
     pts = sorted(points)
-    below = [p for p in pts if p[1] < 1]
-    above = [p for p in pts if p[1] > 1]
-    if not below or not above or above[0][0] <= below[-1][0]:
-        return None
-    lo, hi = below[-1], above[0]
-    cross = lo[0] + (1 - lo[1]) * (hi[0] - lo[0]) / (hi[1] - lo[1])
-    return dict(crossing_lower_fraction=lo[0], crossing_lower_oe=lo[1],
-                crossing_upper_fraction=hi[0], crossing_upper_oe=hi[1], interpolated_crossing=cross)
+    for f, oe in pts:
+        if oe == 1:
+            return dict(crossing_lower_fraction=f, crossing_lower_oe=oe, crossing_upper_fraction=f,
+                        crossing_upper_oe=oe, interpolated_crossing=f)
+    for (f0, o0), (f1, o1) in zip(pts, pts[1:]):
+        if (o0 - 1) * (o1 - 1) < 0 and f1 > f0:
+            cross = f0 + (1 - o0) * (f1 - f0) / (o1 - o0)
+            return dict(crossing_lower_fraction=f0, crossing_lower_oe=o0,
+                        crossing_upper_fraction=f1, crossing_upper_oe=o1, interpolated_crossing=cross)
+    return None

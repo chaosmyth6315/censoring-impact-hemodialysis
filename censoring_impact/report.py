@@ -11,6 +11,10 @@ LABEL = {'as_analyzed': 'As analyzed (departures censored)', 'stayer_rate': 'Sta
          'route_informed': 'Route-informed', 'all_departed_died': 'All departed patients died'}
 
 
+def _f(x, spec='.3f') -> str:
+    return '—' if pd.isna(x) else format(x, spec)
+
+
 def _label(sc) -> str:
     if sc.kind == 'fraction':
         return f'{100 * sc.fraction:g}% of departed patients died'
@@ -62,14 +66,16 @@ def _summary(res, cfg, lab, path: Path) -> Path:
     if 'cx_' + models[0] in d.columns:
         cx = [abs(d.loc[s, f'c_{m}'] - d.loc[s, f'cx_{m}']) for s in d.index for m in models if not pd.isna(d.loc[s, f'cx_{m}'])]
         L.append(f'- Restricting C to pairs formed between different patients changes it by at most {max(cx):.4f}.')
-    L += ['', f'## Paired differences in C against {cfg.reference} (95% patient-clustered bootstrap interval)', '',
-          '| Model | ' + ' | '.join(lab[s] for s in res.paired.scenario.unique()) + ' |',
-          '|---|' + '---|' * res.paired.scenario.nunique()]
-    for m, g in res.paired.groupby('model', sort=False):
-        L.append(f'| {m} | ' + ' | '.join(f'{r.delta:+.4f} ({r.ci_low:+.4f}, {r.ci_high:+.4f})' for r in g.itertuples()) + ' |')
-    flips = [m for m, g in res.paired.groupby('model') if g.excludes_zero.nunique() > 1]
-    if flips:
-        L.append(f"- Whether the interval excludes zero depends on the assumption for: {', '.join(flips)}.")
+    if not res.paired.empty:
+        L += ['', f'## Paired differences in C against {cfg.reference} (95% patient-clustered bootstrap interval)', '',
+              '| Model | ' + ' | '.join(lab[s] for s in res.paired.scenario.unique()) + ' |',
+              '|---|' + '---|' * res.paired.scenario.nunique()]
+        for m, g in res.paired.groupby('model', sort=False):
+            L.append(f'| {m} | ' + ' | '.join(f"{_f(r.delta, '+.4f')} ({_f(r.ci_low, '+.4f')}, {_f(r.ci_high, '+.4f')})"
+                                               for r in g.itertuples()) + ' |')
+        flips = [m for m, g in res.paired.groupby('model') if g.excludes_zero.nunique() > 1]
+        if flips:
+            L.append(f"- Whether the interval excludes zero depends on the assumption for: {', '.join(flips)}.")
     if res.calibration is not None:
         c = res.calibration
         ref = cfg.reference if cfg.reference in c.model.unique() else c.model.unique()[0]
@@ -79,7 +85,7 @@ def _summary(res, cfg, lab, path: Path) -> Path:
         for sc, r in g.iterrows():
             ci = lambda q: (f"({r[f'{q}_ci_low']:.3f}, {r[f'{q}_ci_high']:.3f})"
                             if f'{q}_ci_low' in g.columns and not pd.isna(r.get(f'{q}_ci_low')) else '—')
-            L.append(f"| {lab[sc]} | {r.oe:.3f} | {ci('oe')} | {r.slope:.3f} | {ci('slope')} | {int(r.n_slope):,} |")
+            L.append(f"| {lab[sc]} | {_f(r.oe)} | {ci('oe')} | {_f(r.slope)} | {ci('slope')} | {int(r.n_slope):,} |")
         if res.crossing:
             L.append(f"\n- The point estimate of O:E crosses 1 at about {100 * res.crossing['interpolated_crossing']:.0f}% of "
                      'departed patients assumed to have died at departure (linear interpolation between point estimates).')

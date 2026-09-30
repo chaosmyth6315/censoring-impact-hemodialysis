@@ -164,7 +164,7 @@ for m in S.MODELS:                       # 分箱邊界必須在情境間相同
     assert np.allclose(piv.values, piv.values[:, [0]]), m
 B4.to_csv(TAB/'S4_calibration_bins.csv', index=False)
 
-S4['slope_fixed_primary'] = _fx['primary']; S4['n_fixed_set'] = len(FIXED)
+S4['reference_slope_fixed_primary'] = _fx['primary']; S4['n_fixed_set'] = len(FIXED)   # 參考模型的值(各模型自己的見 S8)
 assert S4.n_km.nunique() == 1, 'O:E 的分母不應隨情境改變'
 S4.to_csv(TAB/'S4_calibration_sensitivity.csv', index=False)
 

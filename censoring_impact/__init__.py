@@ -6,7 +6,7 @@ Implements the fixed-model censoring sensitivity analysis of Fang et al., "How m
 censoring assumption worth? A fixed-model sensitivity analysis of time-updated mortality prediction in
 hemodialysis".
 """
-__version__ = '0.2.1'
+__version__ = '0.3.0'
 
 from .analysis import Config, Results, run          # noqa: F401
 from .core import Arm                               # noqa: F401

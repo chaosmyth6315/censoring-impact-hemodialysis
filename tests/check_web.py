@@ -7,6 +7,9 @@ Needs Node.js. The page's computing core is extracted and run in Node:
   2. The whole analysis on the synthetic example, against the Python tool with the same settings: in the scenarios
      without random assignment, C, between-patient C and O:E must be identical, and the calibration slope must equal a
      fully converged fit (the Python tool stops at scikit-learn's default tolerance, about 1e-4 away).
+  3. Edge cases where the two once differed: rounding of assigned counts at .5, scenario names, a logistic fit that
+     diverged, a constant predictor, the O:E crossing, the censoring distribution at a machine-epsilon boundary, O:E
+     when the slope cannot be fitted, and malformed CSV files.
 Run:  python tests/check_web.py
 """
 import json
@@ -114,6 +117,54 @@ for m in risk:
     ds = abs(cj.loc[('as_analyzed', m), 'slope'] - f.coef_[0, 0])
     check(f'as_analyzed {m}: slope equals the converged fit (|diff| {ds:.1e}; Python tool differs by '
           f"{abs(cp.loc[('as_analyzed', m), 'slope'] - f.coef_[0, 0]):.1e})", ds < 1e-8, ds)
+
+print('\n=== 3. edge cases where the two implementations once differed (Codex review, 2026-09-30) ===')
+from censoring_impact.core import fraction_name, oe_crossing, calibration as py_cal  # noqa: E402
+from censoring_impact.core import censoring_estimator as py_cde  # noqa: E402
+vals = [.5, 1.5, 2.5, 3.5, 7.5, 2.4999, 18.0, 47.127]
+fr = [.25, .5, .75, .125, .251, .254, .3333]
+xs = np.repeat([-2., -2, 0, 0, 2, 2], [10, 3, 1, 9339, 3, 1573])        # once made the web solver diverge
+ys = np.repeat([0, 1, 0, 1, 0, 1], [10, 3, 1, 9339, 3, 1573])
+cases = dict(vals=vals, fr=fr, lx=xs.tolist(), ly=ys.tolist(),
+             crossing=[[[0, .8], [.4, 1.0], [1, 1.2]], [[0, .9], [.5, 1.1], [.75, .95], [1, 1.2]], [[0, .9], [1, .95]]])
+(TMP/'edge.json').write_text(json.dumps(cases))
+J = node("""const C = require('./core.js'), k = require('./edge.json'), out = {};
+out.round = k.vals.map(C.roundHalfEven); out.names = k.fr.map(C.fractionName);
+out.fit = C.logisticFit(k.lx, k.ly, k.lx.map(() => 1)); out.flat = C.logisticFit([0, 0, 0, 0], [1, 0, 0, 0], [1, 1, 1, 1]);
+out.cross = k.crossing.map(C.oeCrossing);
+const G = C.censoringEstimator(Float64Array.from([0.1, 1]), Uint8Array.from([0, 1])); out.g = C.predictG(G, 0.09999999999999999);
+const cal = C.calibration(Uint8Array.from([1, 0, 0]), Float64Array.from([2, 3, 4]), [0, 1, 2], { m: Float64Array.from([.2, .3, .4]) }, 1,
+  C.censoringEstimator(Float64Array.from([2, 3, 4]), Uint8Array.from([1, 0, 0]))); out.cal = cal.m;
+out.csv = ['id,t\\n1,"2\\n', 'id,id\\n1,2\\n', 'id,t\\n1,2\\n3\\n'].map(t => { try { C.parseCSV(t); return 'accepted'; } catch (e) { return 'rejected'; } });
+console.log(JSON.stringify(out, (key, v) => (typeof v === 'number' && !Number.isFinite(v)) ? null : v));""")
+check('rounding of assigned counts: web equals Python round()', J['round'] == [round(v) for v in vals], J['round'])
+check('scenario names: web equals Python', J['names'] == [fraction_name(f) for f in fr], J['names'])
+ref = LogisticRegression(solver='newton-cg', C=np.inf, tol=1e-12, max_iter=100000).fit(xs[:, None], ys).coef_[0, 0]
+check(f"logistic fit that once diverged now converges (web {J['fit']['slope']}, converged {ref:.8f})",
+      J['fit']['slope'] is not None and abs(J['fit']['slope'] - ref) < 1e-6)
+check('constant predictor gives no slope (NaN), not 0', J['flat']['slope'] is None)
+py_cross = [None if (c := oe_crossing([tuple(p) for p in pts])) is None else c['interpolated_crossing'] for pts in cases['crossing']]
+check('O:E crossing: web equals Python', all((a is None and b is None) or (a is not None and b is not None and abs(a - b) < 1e-12)
+                                            for a, b in zip(J['cross'], py_cross)), (J['cross'], py_cross))
+e3, t3 = np.array([True, False]), np.array([0.1, 1.0])
+g_ref = py_cde(~e3, t3).predict_proba(np.array([0.09999999999999999]))[0]
+check(f"censoring distribution at a time within machine epsilon of an observation (web {J['g']}, sksurv {g_ref})", J['g'] == g_ref)
+pc = py_cal(np.array([1, 0, 0], bool), np.array([2., 3., 4.]), np.arange(3), {'m': np.array([.2, .3, .4])}, 1.0,
+            py_cde(np.array([1, 0, 0], bool), np.array([2., 3., 4.])))['m']
+check('O:E kept when the slope cannot be fitted, same in both', J['cal']['oe'] == pc['oe'] == 0 and J['cal']['slope'] is None and np.isnan(pc['slope']))
+check('malformed CSV is rejected (open quote, repeated header, short row)', J['csv'] == ['rejected'] * 3, J['csv'])
+# assigned counts at .5 boundaries, whole analysis
+ids = [f'p{i:02d}' for i in range(12)]
+arm2 = Arm(pid=ids, time=np.arange(1, 13, dtype=float), event=[1, 0] + [0] * 10, departed=[0, 0] + [1] * 10)
+py2 = run(arm2, Config(risk={'m': np.arange(12, dtype=float)}, reference='m', fractions=(.25, .75), n_draws=4, n_boot=0), log=lambda *_: None)
+(TMP/'half.json').write_text(json.dumps(dict(pid=ids, time=list(range(1, 13)), event=[1, 0] + [0] * 10, departed=[0, 0] + [1] * 10)))
+J2 = node("""const C = require('./core.js'), d = require('./half.json');
+C.runAnalysis({ pid: d.pid, time: Float64Array.from(d.time), event: Uint8Array.from(d.event), departed: Uint8Array.from(d.departed),
+  route: null, elig: null, risk: { m: Float64Array.from(d.time.map((_, i) => i)) }, riskH: null },
+  { fractions: [.25, .75], draws: 4, boot: 0, seed: 1, between: false, horizon: 0, reference: 'm' })
+  .then(r => console.log(JSON.stringify(Object.fromEntries(r.discrimination.map(x => [x.scenario, x.departed_assigned_death])))));""")
+py_k = dict(zip(py2.discrimination.scenario, py2.discrimination.departed_assigned_death))
+check(f'assigned deaths at .5 boundaries equal in both (web {J2}, Python {py_k})', J2 == py_k)
 
 print(f"\n{'ALL CHECKS PASSED' if not FAIL else f'{len(FAIL)} FAILED: ' + '; '.join(FAIL)}")
 sys.exit(1 if FAIL else 0)

@@ -34,8 +34,9 @@ python -m censoring_impact --data evaluation.csv --id patient_id --time time --e
 
 One row per evaluation unit (a patient or a patient-period); `departed` marks patients who left follow-up. Your data
 stay on your computer. Try it first with `python examples/make_example_data.py` and the command in that file.
-The tool reproduces every number in the paper from the study's inputs; the reproduction test needs the
-non-distributed data and is kept by the authors.
+The tool reproduces the paper's censoring-sensitivity results (discrimination, paired differences, calibration and
+the O:E crossing) exactly from the study's inputs; the paper's other numbers come from the scripts in `analysis/`.
+The reproduction test needs the non-distributed data and is kept by the authors.
 
 ## Results files
 

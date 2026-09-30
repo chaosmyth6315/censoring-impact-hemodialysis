@@ -7,8 +7,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from censoring_impact.analysis import Config, run  # noqa: E402
-from censoring_impact.core import (Arm, Assignments, between_patient_c, build_scenarios, generate_draws,  # noqa: E402
-                                   harrell_c, oe_crossing, stayer_rate)
+from censoring_impact.core import (Arm, Assignments, between_patient_c, build_scenarios, calibration,  # noqa: E402
+                                   censoring_estimator, fraction_name, generate_draws, harrell_c, oe_crossing,
+                                   stayer_rate)
 
 
 def toy(n_pt=120, rows_per=3, seed=1, route=False):
@@ -91,3 +92,77 @@ def test_run_end_to_end_small():
         assert r.delta == pytest.approx(d.loc[r.scenario, 'c_alt'] - d.loc[r.scenario, 'c_ref'])
     assert set(res.paired.scenario) == {'as_analyzed', 'stayer_rate', 'all_departed_died'}
     assert res.calibration is not None and res.calibration.n_km.nunique() == 1   # O:E denominator fixed
+
+
+# ---------------------------------------------------------------- regressions from the Codex review (2026-09-30)
+def test_flags_are_parsed_strictly():
+    a = Arm(pid=['a', 'b', 'c'], time=[1, 2, 3], event=['0', '1', '0'], departed=['no', 'no', 'yes'])
+    assert a.event.tolist() == [False, True, False] and a.departed.tolist() == [False, False, True]
+    for bad in (['0', '2', '0'], [0, np.nan, 0], ['maybe', '0', '0']):
+        with pytest.raises(ValueError):
+            Arm(pid=['a', 'b', 'c'], time=[1, 2, 3], event=bad, departed=[0, 0, 0])
+    with pytest.raises(ValueError):
+        Arm(pid=['a', None, 'c'], time=[1, 2, 3], event=[0, 1, 0], departed=[0, 0, 0])
+
+
+def test_cli_keeps_identifiers_as_written(tmp_path):
+    from types import SimpleNamespace
+    from censoring_impact.cli import _arm, _read
+    f = tmp_path / 'd.csv'
+    f.write_text('patient_id,time,event,departed,risk\n001,1,1,0,2\n1,4,0,0,1\nNA,2,0,1,3\n3,3,0,1,0\n')
+    a = SimpleNamespace(id='patient_id', time='time', event='event', departed='departed', route=None)
+    arm = _arm(_read(str(f), a), a, 'test')
+    assert arm.pid.tolist() == ['001', '1', 'NA', '3'] and stayer_rate(arm) == 0.5
+
+
+def test_fraction_names_are_distinct_and_validated():
+    assert [fraction_name(f) for f in (.25, .5, .125, .251, .254)] == [
+        'fraction_0.25', 'fraction_0.50', 'fraction_0.125', 'fraction_0.251', 'fraction_0.254']
+    for bad in ((.25, .25), (.25001,), (0,), (1,)):
+        with pytest.raises(ValueError):
+            build_scenarios(bad, .5, False)
+
+
+def test_assigned_counts_round_halves_to_even():
+    a = Arm(pid=[f'p{i}' for i in range(12)], time=[1] * 12, event=[1, 0] + [0] * 10, departed=[0, 0] + [1] * 10)
+    draws = generate_draws({'evaluation': a}, (.25, .75), .5, 3, 1, False)
+    k = {sc: set(g['mask'].map(lambda m: m.count('1'))) for sc, g in draws.groupby('scenario')}
+    assert k == {'fraction_0.25': {2}, 'fraction_0.75': {8}, 'stayer_rate': {5}}      # 2.5 -> 2, 7.5 -> 8
+
+
+def test_oe_kept_when_the_slope_cannot_be_fitted():
+    e, t = np.array([1, 0, 0], bool), np.array([2., 3., 4.])
+    r = calibration(e, t, np.arange(3), {'m': np.array([.2, .3, .4])}, 1.0, censoring_estimator(e, t))['m']
+    assert r['oe'] == 0 and r['expected'] == pytest.approx(.3) and np.isnan(r['slope']) and r['n_slope'] == 0
+
+
+def test_constant_predicted_risk_gives_no_slope():
+    e, t = np.array([1, 0, 0, 0], bool), np.array([1., 3., 3., 3.])
+    r = calibration(e, t, np.arange(4), {'m': np.full(4, .5)}, 2.0, censoring_estimator(e, t))['m']
+    assert np.isnan(r['slope']) and np.isfinite(r['oe'])
+
+
+def test_invalid_inputs_are_rejected():
+    a, rng = toy(n_pt=60)
+    risk = {'m': rng.random(a.pid.size)}
+    with pytest.raises(ValueError):                                   # probabilities outside 0-1
+        run(a, Config(risk=risk, reference='m', risk_h={'m': risk['m'] + 1}, horizon=365, n_draws=2, n_boot=0), log=lambda *_: None)
+    with pytest.raises(ValueError):                                   # everyone departed
+        run(Arm(pid=['a', 'b'], time=[1, 2], event=[0, 0], departed=[1, 1]), Config(risk={'m': [1., 2.]}, reference='m'), log=lambda *_: None)
+    with pytest.raises(ValueError):                                   # no deaths at all
+        run(Arm(pid=['a', 'b', 'c'], time=[1, 2, 3], event=[0, 0, 0], departed=[0, 0, 1]),
+            Config(risk={'m': [1., 2., 3.]}, reference='m'), log=lambda *_: None)
+
+
+def test_oe_crossing_exact_and_first_sign_change():
+    assert oe_crossing([(0, .8), (.4, 1.0), (1, 1.2)])['interpolated_crossing'] == .4
+    assert oe_crossing([(0, .9), (.5, 1.1), (.75, .95), (1, 1.2)])['interpolated_crossing'] == pytest.approx(.25)
+
+
+def test_single_model_report_is_written(tmp_path):
+    from censoring_impact.report import write
+    a, rng = toy(n_pt=80)
+    cfg = Config(risk={'only': rng.random(a.pid.size)}, reference='only', n_draws=3, n_boot=10)
+    res = run(a, cfg, log=lambda *_: None)
+    files = write(res, cfg, tmp_path, {})
+    assert (tmp_path / 'summary.md').exists() and res.paired.empty and len(files) >= 5

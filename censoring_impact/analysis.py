@@ -10,8 +10,13 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from .core import (Arm, Assignments, Scenario, between_patient_c, build_scenarios, calibration,
-                   censoring_estimator, generate_draws, harrell_c, oe_crossing, stayer_rate)
+from .core import (Arm, Assignments, Scenario, between_patient_c, binary, build_scenarios, calibration,
+                   censoring_estimator, check_fractions, generate_draws, harrell_c, oe_crossing, stayer_rate)
+
+
+def _mean(v) -> float:
+    v = np.asarray(v, dtype=float)
+    return float(v[np.isfinite(v)].mean()) if np.isfinite(v).any() else float('nan')
 
 
 @dataclass
@@ -55,8 +60,11 @@ def run(evaluation: Arm, cfg: Config, weights: Arm | None = None, log=print) -> 
     risk = {m: np.asarray(v, dtype=float) for m, v in cfg.risk.items()}
     n = len(evaluation.pid)
     for m, v in risk.items():
-        if len(v) != n or np.isnan(v).any():
+        if len(v) != n or not np.isfinite(v).all():
             raise ValueError(f'risk scores for {m!r} must be complete and match the data')
+    if not evaluation.event.any():
+        raise ValueError('no deaths are recorded in the evaluation data, so the concordance index is undefined')
+    fractions = check_fractions(cfg.fractions)
     with_route = evaluation.route is not None
     arms = {'evaluation': evaluation}
     if weights is not None:
@@ -67,8 +75,8 @@ def run(evaluation: Arm, cfg: Config, weights: Arm | None = None, log=print) -> 
             raise ValueError('the weights data need the route column too')
         arms['weights'] = weights
     rate = stayer_rate(evaluation)
-    scenarios = build_scenarios(cfg.fractions, rate, with_route)
-    draws = generate_draws(arms, cfg.fractions, rate, cfg.n_draws, cfg.seed, with_route)
+    scenarios = build_scenarios(fractions, rate, with_route)
+    draws = generate_draws(arms, fractions, rate, cfg.n_draws, cfg.seed, with_route)
     A = Assignments(arms, draws, cfg.n_draws)
     ids = evaluation.departed_ids
     exposure = dict(
@@ -149,19 +157,30 @@ def run(evaluation: Arm, cfg: Config, weights: Arm | None = None, log=print) -> 
                              delta=float(dsc.loc[sc.name, f'c_{m}'] - dsc.loc[sc.name, f'c_{cfg.reference}']),
                              ci_low=float(lo), ci_high=float(hi), excludes_zero=bool(lo > 0 or hi < 0),
                              n_boot=int(diffs.size), assignment_sd=sd))
-    paired = pd.DataFrame(prow)
+    paired = pd.DataFrame(prow, columns=['scenario', 'model', 'reference', 'c_model', 'c_reference', 'delta', 'ci_low',
+                                         'ci_high', 'excludes_zero', 'n_boot', 'assignment_sd'])
     res = Results(exposure=exposure, scenarios=scenarios, draws=draws, discrimination=disc, paired=paired)
 
     # ---------------------------------------------------------- calibration
     if cfg.risk_h is None:
         res.notes.append('Calibration not computed: no predicted risks at a horizon were supplied.')
         return res
-    if cfg.horizon is None:
-        raise ValueError('a horizon is needed for calibration')
+    if cfg.horizon is None or not np.isfinite(cfg.horizon) or cfg.horizon <= 0:
+        raise ValueError('a positive horizon is needed for calibration')
     risk_h = {m: np.asarray(v, dtype=float) for m, v in cfg.risk_h.items()}
     elig = (np.ones(n, dtype=bool) if cfg.calibration_eligible is None
-            else np.asarray(cfg.calibration_eligible).astype(bool))
+            else binary(cfg.calibration_eligible, 'calibration_eligible'))
+    if len(elig) != n:
+        raise ValueError('calibration_eligible must match the data')
     sub = np.flatnonzero(elig)
+    for m, v in risk_h.items():
+        if len(v) != n:
+            raise ValueError(f'predicted risks for {m!r} must match the data')
+        u = v[sub]
+        if not (np.isfinite(u).all() and (u >= 0).all() and (u <= 1).all()):
+            raise ValueError(f'predicted risks for {m!r} must be probabilities between 0 and 1 on every eligible row')
+    if not (evaluation.time[sub] > cfg.horizon).any():
+        res.notes.append('No eligible row is followed beyond the horizon, so the calibration slope cannot be estimated.')
     warm = 'weights' if weights is not None else 'evaluation'
     wa = arms[warm]
 
@@ -181,9 +200,10 @@ def run(evaluation: Arm, cfg: Config, weights: Arm | None = None, log=print) -> 
                 for k in acc[m]:
                     acc[m][k].append(r[m][k])
         for m in risk_h:
-            rec = {k: (float(np.mean(v)) if v else np.nan) for k, v in acc[m].items()}
+            rec = {k: _mean(v) for k, v in acc[m].items()}
+            fitted = [k for k, sl in zip(acc[m]['n_slope'], acc[m]['slope']) if np.isfinite(sl)]
             rec['n_km'] = int(round(rec['n_km'])) if acc[m]['n_km'] else 0
-            rec['n_slope'] = int(round(rec['n_slope'])) if acc[m]['n_slope'] else 0
+            rec['n_slope'] = int(round(float(np.mean(fitted)))) if fitted else 0
             crow.append(dict(scenario=sc.name, assumed_fraction=sc.fraction, model=m, n_draws=nd, **rec))
     cal = pd.DataFrame(crow)
 
@@ -203,7 +223,9 @@ def run(evaluation: Arm, cfg: Config, weights: Arm | None = None, log=print) -> 
             if r is None:
                 continue
             for m in risk_h:
-                bacc[(sc.name, m, 'slope')].append(r[m]['slope']); bacc[(sc.name, m, 'oe')].append(r[m]['oe'])
+                for q in ('slope', 'oe'):
+                    if np.isfinite(r[m][q]):
+                        bacc[(sc.name, m, q)].append(r[m][q])
         if (b + 1) % 250 == 0:
             log(f'  {b + 1}/{cfg.n_boot} ({_time.time() - t0:.0f}s)')
     for i, r in cal.iterrows():
