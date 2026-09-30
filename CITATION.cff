@@ -4,6 +4,8 @@ title: "Censoring impact in time-updated mortality prediction for hemodialysis: 
 version: 0.2.1
 date-released: 2026-09-30
 license: MIT
+doi: 10.5281/zenodo.23055754
+repository-code: "https://github.com/chaosmyth6315/censoring-impact-hemodialysis"
 authors:
   - family-names: Fang
     given-names: Yu-Wei
