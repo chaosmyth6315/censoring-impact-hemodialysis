@@ -1,5 +1,7 @@
 # Censoring impact in time-updated mortality prediction for hemodialysis
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23055754.svg)](https://doi.org/10.5281/zenodo.23055754)
+
 Code and aggregate results for:
 
 > Fang YW, Huang YC, Wang JT, Tsai MH. How much is the non-informative censoring assumption worth? A fixed-model
@@ -65,6 +67,13 @@ The patient-level data are not publicly available because the records remain re-
 durations). A de-identified analysis data set is available from the corresponding author on reasonable request,
 subject to approval by the data custodian and the institutional ethics review board (IRB 20260606R, Shin-Kong Wu
 Ho-Su Memorial Hospital). Excluded from this repository for that reason: `S0_scenario_draws.csv` (per-patient assignment masks), `S5_route_assignment.csv` (patient identifiers), `S3_design_comparison.csv` (analysis not part of this paper).
+
+## Citing
+
+Please cite the paper above. To cite the code and results themselves: Fang YW, Huang YC, Wang JT, Tsai MH.
+Censoring impact in time-updated mortality prediction for hemodialysis: code and aggregate results [software].
+Zenodo. https://doi.org/10.5281/zenodo.23055754. This DOI always points to the latest release; each release also has its own DOI,
+listed on the Zenodo page.
 
 ## License
 
