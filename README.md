@@ -10,12 +10,18 @@ Code and aggregate results for:
 | Folder | Content |
 |---|---|
 | `censoring_impact/` | A tool that runs the same analysis on your own data: hold fitted models fixed, reassign a share of patients who left follow-up as deaths at departure, and see how discrimination and calibration move. See `censoring_impact` usage below. |
+| `web/` | `censoring_impact.html`: the same tool as a single web page, online at <https://chaosmyth6315.github.io/censoring-impact-hemodialysis/web/censoring_impact.html> or downloaded and opened in a browser. Choose your CSV and run; nothing is uploaded, and the downloaded page works offline. |
 | `results/` | Aggregate result tables from which every number in the paper is computed (no patient-level data). |
 | `figures/` | `redraw_from_results.py` redraws Figures 2 and 3 from `results/` alone. |
 | `analysis/` | The analysis scripts used for the paper. They read the locked model outputs, which contain patient-level data and are not distributed; set `LOCKED_DIR` and `RESULTS_DIR` to run them where the data are available. Comments are in Chinese. |
-| `tests/`, `examples/` | Unit tests of the tool and a synthetic example data set. |
+| `tests/`, `examples/` | Unit tests of the tool, a check of the web version against the Python tool, and a synthetic example data set. |
 
 ## Using the tool on your own data
+
+Without installing anything: open <https://chaosmyth6315.github.io/censoring-impact-hemodialysis/web/censoring_impact.html>, or download `web/censoring_impact.html` and open it in a browser.
+Everything is computed in your browser; your data are not uploaded.
+
+With Python:
 
 ```bash
 pip install -r requirements.txt
